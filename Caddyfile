@@ -1,0 +1,30 @@
+# V8Box Caddyfile - Reverse Proxy with Auto SSL
+
+# Wildcard domain for all subdomains
+*.{$DOMAIN:localhost}, {$DOMAIN:localhost} {
+	# Auto HTTPS with Cloudflare DNS (production)
+	tls {
+		dns cloudflare {$CF_API_TOKEN}
+	} {$DOMAIN:localhost}
+
+	# Development: TLS internal (self-signed)
+	tls internal {
+		on_demand
+	}
+
+	# Route to V8Box server
+	reverse_proxy v8box:8000 {
+		header_up Host {host}
+		header_up X-Real-IP {remote}
+		header_up X-Forwarded-For {remote}
+		header_up X-Forwarded-Proto {scheme}
+	}
+
+	# Enable compression
+	encode gzip
+
+	# Logging
+	log {
+		output file /data/access.log
+	}
+}

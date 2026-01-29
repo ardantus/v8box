@@ -1,0 +1,22 @@
+{
+    "tasks": {
+        "dev": "deno run --allow-net --allow-read --allow-write --allow-env --allow-run --watch server.ts",
+        "start": "deno run --allow-net --allow-read --allow-write --allow-env --allow-run server.ts"
+    },
+    "imports": {
+        "hono": "https://deno.land/x/hono@v4.0.2/mod.ts",
+        "hono/": "https://deno.land/x/hono@v4.0.2/",
+        "@libsql/client": "npm:@libsql/client@^0.5.0",
+        "redis": "https://deno.land/x/redis@v0.32.1/mod.ts",
+        "@aws-sdk/client-s3": "npm:@aws-sdk/client-s3@^3.490.0",
+        "jszip": "npm:jszip@^3.10.1",
+        "std/": "https://deno.land/std@0.210.0/"
+    },
+    "compilerOptions": {
+        "lib": [
+            "deno.window",
+            "dom"
+        ],
+        "strict": true
+    }
+}
