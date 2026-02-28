@@ -1,8 +1,7 @@
 // Hono Framework
-export { Hono } from "hono";
-export { getCookie, setCookie, deleteCookie } from "hono/cookie";
-export { serveStatic } from "hono/deno";
-export type { Context, Next } from "hono";
+export { Hono } from "npm:hono@4.0.2";
+export { getCookie, setCookie, deleteCookie } from "npm:hono@4.0.2/cookie";
+export type { Context, Next } from "npm:hono@4.0.2";
 
 // LibSQL
 export { createClient } from "@libsql/client";
@@ -13,7 +12,17 @@ export { connect } from "redis";
 export type { Redis } from "redis";
 
 // AWS S3
-export { S3Client, ListObjectsV2Command, DeleteObjectCommand, PutObjectCommand, GetObjectCommand } from "@aws-sdk/client-s3";
+export {
+	S3Client,
+	ListObjectsV2Command,
+	ListBucketsCommand,
+	DeleteObjectCommand,
+	DeleteBucketCommand,
+	CopyObjectCommand,
+	PutObjectCommand,
+	GetObjectCommand,
+	CreateBucketCommand,
+} from "@aws-sdk/client-s3";
 export type { S3Client as S3ClientType } from "@aws-sdk/client-s3";
 
 // JSZip

@@ -1,15 +1,22 @@
+import type { ServiceContext } from "../types.ts";
+
 // Example worker: Hello World with database access
-export default async function handler({ db, cache, s3 }, params) {
+// Bisa dipanggil via:
+// - Localhost mode: /run/hello
+// - Domain mode: api.<domain>/run/hello
+export default async function handler({ db, cache, s3 }: ServiceContext, params: Record<string, unknown> = {}) {
     try {
-        // Get visitor count from cache
+        // 1) Ambil counter pengunjung dari cache
         let count = await cache.get("visitor_count");
         count = count ? parseInt(count) : 0;
         count++;
 
-        // Update cache
+        // 2) Simpan lagi counter terbaru ke cache
         await cache.set("visitor_count", count.toString());
 
-        // Log to database (create table if not exists)
+        // 3) Simpan log request ke database
+        //    - Buat tabel jika belum ada
+        //    - Simpan payload params agar bisa dilihat kembali dari query SQL
         try {
             await db.execute(`
         CREATE TABLE IF NOT EXISTS visits (
@@ -24,9 +31,11 @@ export default async function handler({ db, cache, s3 }, params) {
                 args: [JSON.stringify(params)]
             });
         } catch (dbError) {
+            // Logging ke DB bersifat best-effort: worker tetap sukses walau DB error
             console.error("Database error:", dbError);
         }
 
+        // 4) Kembalikan response JSON
         return {
             success: true,
             message: "Hello from V8Box!",
@@ -35,9 +44,10 @@ export default async function handler({ db, cache, s3 }, params) {
             timestamp: new Date().toISOString()
         };
     } catch (error) {
+        // Error utama worker
         return {
             success: false,
-            error: error.message
+            error: error instanceof Error ? error.message : String(error)
         };
     }
 }

@@ -3,6 +3,11 @@
 export default async function handler({ db, cache, s3 }, params) {
     try {
         const { filename, content } = params;
+        const bucket = params.bucket ||
+            Deno.env.get("S3_FUNCTIONS_BUCKET") ||
+            Deno.env.get("S3_DEFAULT_BUCKET") ||
+            Deno.env.get("S3_BUCKET") ||
+            "v8box";
 
         if (!filename || !content) {
             return {
@@ -15,7 +20,7 @@ export default async function handler({ db, cache, s3 }, params) {
         const { PutObjectCommand } = await import("@aws-sdk/client-s3");
 
         const command = new PutObjectCommand({
-            Bucket: Deno.env.get("S3_BUCKET") || "v8box",
+            Bucket: bucket,
             Key: filename,
             Body: new TextEncoder().encode(content),
             ContentType: "text/plain"
@@ -29,6 +34,7 @@ export default async function handler({ db, cache, s3 }, params) {
         return {
             success: true,
             message: "File uploaded successfully",
+            bucket,
             filename: filename,
             size: content.length,
             timestamp: new Date().toISOString()

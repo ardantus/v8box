@@ -7,21 +7,29 @@ import {
     connect,
     S3Client,
     ListObjectsV2Command,
+    ListBucketsCommand,
     DeleteObjectCommand,
+    DeleteBucketCommand,
+    CopyObjectCommand,
+    CreateBucketCommand,
+    PutObjectCommand,
     GetObjectCommand,
     JSZip,
     exists,
     join,
     extname,
-    basename,
     ensureDir,
 } from "./deps.ts";
-import type { Context, Next } from "./deps.ts";
-import type { ServiceContext, ApiResponse, ExecutionLog, PageProject, S3Object } from "./types.ts";
+  import type { Context, Next } from "./deps.ts";
+import type { ServiceContext, ApiResponse, ExecutionLog, PageProject, S3Object, S3Bucket } from "./types.ts";
 
 // ============================================================================
 // CONFIGURATION
 // ============================================================================
+
+const s3DefaultBucket = Deno.env.get("S3_DEFAULT_BUCKET") || Deno.env.get("S3_BUCKET") || "v8box";
+const s3ProjectsBucket = Deno.env.get("S3_PROJECTS_BUCKET") || `${s3DefaultBucket}-projects`;
+const s3FunctionsBucket = Deno.env.get("S3_FUNCTIONS_BUCKET") || `${s3DefaultBucket}-functions`;
 
 const config = {
     adminPassword: Deno.env.get("ADMIN_PASSWORD") || "admin123",
@@ -31,11 +39,29 @@ const config = {
     s3Endpoint: Deno.env.get("S3_ENDPOINT") || "http://localhost:8333",
     s3AccessKey: Deno.env.get("S3_ACCESS_KEY") || "",
     s3SecretKey: Deno.env.get("S3_SECRET_KEY") || "",
-    s3Bucket: Deno.env.get("S3_BUCKET") || "v8box",
+  s3DefaultBucket,
+  s3ProjectsBucket,
+  s3FunctionsBucket,
     s3Region: Deno.env.get("S3_REGION") || "us-east-1",
     domain: Deno.env.get("DOMAIN") || "domain.tld",
     port: parseInt(Deno.env.get("PORT") || "8000"),
 };
+
+  const isLocalhostMode = config.domain === "localhost";
+
+  function getWorkerBaseUrl(): string {
+    if (isLocalhostMode) {
+      return `http://localhost:${config.port}`;
+    }
+    return `http://api.${config.domain}:${config.port}`;
+  }
+
+  function getProjectBaseUrl(projectName: string): string {
+    if (isLocalhostMode) {
+      return `http://localhost:${config.port}/pages/${projectName}`;
+    }
+    return `http://${projectName}.${config.domain}:${config.port}`;
+  }
 
 // ============================================================================
 // SERVICE INITIALIZATION
@@ -46,6 +72,8 @@ const db = createClient({
     url: config.libsqlUrl,
     authToken: config.libsqlAuthToken,
 });
+const DATABASE_META_TABLE = "__v8box_databases";
+const TABLE_META_TABLE = "__v8box_tables";
 
 // Valkey (Redis) Client
 const cache = await connect({
@@ -64,6 +92,63 @@ const s3 = new S3Client({
     forcePathStyle: true,
 });
 
+function getManagedBucketNames(): string[] {
+    return [...new Set([
+        config.s3DefaultBucket,
+        config.s3ProjectsBucket,
+        config.s3FunctionsBucket,
+    ].filter(Boolean))];
+}
+
+async function bucketExists(bucketName: string): Promise<boolean> {
+    try {
+        await s3.send(new ListObjectsV2Command({ Bucket: bucketName, MaxKeys: 1 }));
+        return true;
+    } catch (error) {
+        if (String(error).includes("NoSuchBucket")) {
+            return false;
+        }
+        throw error;
+    }
+}
+
+async function ensureS3Buckets(): Promise<void> {
+    for (const bucketName of getManagedBucketNames()) {
+        try {
+            const exists = await bucketExists(bucketName);
+            if (!exists) {
+                await s3.send(new CreateBucketCommand({ Bucket: bucketName }));
+                console.log(`✅ Created S3 bucket: ${bucketName}`);
+            }
+        } catch (error) {
+            console.error(`⚠️ Failed to verify/create S3 bucket ${bucketName}:`, error);
+        }
+    }
+}
+
+await ensureS3Buckets();
+
+async function ensureDatabaseMetadataTables(): Promise<void> {
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS ${DATABASE_META_TABLE} (
+      name TEXT PRIMARY KEY,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  await db.execute(`
+    CREATE TABLE IF NOT EXISTS ${TABLE_META_TABLE} (
+      database_name TEXT NOT NULL,
+      table_name TEXT NOT NULL,
+      physical_name TEXT NOT NULL UNIQUE,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      PRIMARY KEY (database_name, table_name)
+    )
+  `);
+}
+
+await ensureDatabaseMetadataTables();
+
 // Service Context for Workers
 const services: ServiceContext = { db, cache, s3 };
 
@@ -78,7 +163,13 @@ function isValidName(name: string): boolean {
 
 // Get subdomain from hostname
 function getSubdomain(hostname: string): string {
-    const parts = hostname.split(".");
+  const hostWithoutPort = hostname.split(":")[0];
+  const parts = hostWithoutPort.split(".");
+
+  if (parts.length === 2 && parts[1] === "localhost") {
+    return parts[0] === "localhost" ? "" : parts[0];
+  }
+
     if (parts.length > 2) {
         return parts[0];
     }
@@ -130,6 +221,185 @@ function getMimeType(ext: string): string {
         ".pdf": "application/pdf",
     };
     return mimeTypes[ext.toLowerCase()] || "application/octet-stream";
+}
+
+function isValidBucketName(name: string): boolean {
+  return /^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$/.test(name);
+}
+
+function isValidDatabaseName(name: string): boolean {
+  return /^[a-zA-Z][a-zA-Z0-9_-]{1,62}$/.test(name);
+}
+
+function isValidIdentifier(name: string): boolean {
+  return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(name);
+}
+
+function quoteIdentifier(name: string): string {
+  if (!isValidIdentifier(name)) {
+    throw new Error(`Invalid SQL identifier: ${name}`);
+  }
+  return `"${name}"`;
+}
+
+function getDatabaseClient(): typeof db {
+  return db;
+}
+
+function getPhysicalTableName(databaseName: string, tableName: string): string {
+  return `v8db_${databaseName}__${tableName}`;
+}
+
+function escapeRegex(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+async function resolveTableName(databaseName: string, tableName: string): Promise<string> {
+  if (databaseName === "global") {
+    return tableName;
+  }
+
+  const mapping = await db.execute({
+    sql: `SELECT physical_name FROM ${TABLE_META_TABLE} WHERE database_name = ? AND table_name = ? LIMIT 1`,
+    args: [databaseName, tableName],
+  });
+
+  if (mapping.rows.length === 0) {
+    throw new Error("Table not found");
+  }
+
+  return String((mapping.rows[0] as Record<string, unknown>).physical_name || "");
+}
+
+async function rewriteQueryForDatabase(databaseName: string, query: string): Promise<string> {
+  if (databaseName === "global") {
+    return query;
+  }
+
+  const mappings = await db.execute({
+    sql: `SELECT table_name, physical_name FROM ${TABLE_META_TABLE} WHERE database_name = ? ORDER BY LENGTH(table_name) DESC`,
+    args: [databaseName],
+  });
+
+  let rewritten = query;
+  for (const row of mappings.rows) {
+    const mapping = row as Record<string, unknown>;
+    const virtualName = String(mapping.table_name || "");
+    const physicalName = String(mapping.physical_name || "");
+    if (!virtualName || !physicalName) {
+      continue;
+    }
+
+    const regex = new RegExp(`\\b${escapeRegex(virtualName)}\\b`, "g");
+    rewritten = rewritten.replace(regex, physicalName);
+  }
+
+  return rewritten;
+}
+
+async function listDatabaseNames(): Promise<string[]> {
+  const names = new Set<string>(["global"]);
+
+  const rows = await db.execute(`SELECT name FROM ${DATABASE_META_TABLE} ORDER BY name`);
+  for (const row of rows.rows) {
+    const name = String((row as Record<string, unknown>).name || "");
+    if (name) {
+      names.add(name);
+    }
+  }
+
+  return Array.from(names).sort();
+}
+
+async function createDatabase(databaseName: string): Promise<void> {
+  if (!isValidDatabaseName(databaseName) || databaseName === "global") {
+    throw new Error("Invalid database name");
+  }
+
+  const existsResult = await db.execute({
+    sql: `SELECT 1 AS ok FROM ${DATABASE_META_TABLE} WHERE name = ? LIMIT 1`,
+    args: [databaseName],
+  });
+  if (existsResult.rows.length > 0) {
+    throw new Error("Database already exists");
+  }
+
+  await db.execute({
+    sql: `INSERT INTO ${DATABASE_META_TABLE} (name) VALUES (?)`,
+    args: [databaseName],
+  });
+}
+
+async function ensureDatabaseExists(databaseName: string): Promise<void> {
+  if (!isValidDatabaseName(databaseName) || databaseName === "global") {
+    throw new Error("Invalid database name");
+  }
+
+  const existsResult = await db.execute({
+    sql: `SELECT 1 AS ok FROM ${DATABASE_META_TABLE} WHERE name = ? LIMIT 1`,
+    args: [databaseName],
+  });
+
+  if (existsResult.rows.length === 0) {
+    throw new Error("Database not found");
+  }
+}
+
+function sqlLiteral(value: unknown): string {
+  if (value === null) {
+    return "NULL";
+  }
+  if (typeof value === "number") {
+    return `${value}`;
+  }
+  if (typeof value === "boolean") {
+    return value ? "1" : "0";
+  }
+  return `'${String(value).replaceAll("'", "''")}'`;
+}
+
+async function parseRequestPayload(c: Context): Promise<Record<string, unknown>> {
+  const contentType = c.req.header("content-type") || "";
+  if (contentType.includes("application/json")) {
+    const body = await c.req.json().catch(() => ({}));
+    return (body && typeof body === "object") ? (body as Record<string, unknown>) : {};
+  }
+
+  const body = await c.req.parseBody();
+  return Object.fromEntries(Object.entries(body));
+}
+
+function parseWhereInput(payload: Record<string, unknown>): { where: string; whereArgs: unknown[] } {
+  const where = String(payload.where || "").trim();
+  const whereArgsRaw = payload.whereArgs;
+  const whereArgs = Array.isArray(whereArgsRaw) ? whereArgsRaw : [];
+
+  if (!where) {
+    throw new Error("where is required");
+  }
+
+  if (where.includes(";")) {
+    throw new Error("Invalid where clause");
+  }
+
+  const invalidArg = whereArgs.find((arg) => {
+    return arg !== null && ["string", "number", "boolean"].includes(typeof arg) === false;
+  });
+
+  if (invalidArg !== undefined) {
+    throw new Error("whereArgs must contain only string, number, boolean, or null");
+  }
+
+  return { where, whereArgs };
+}
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
 }
 
 // ============================================================================
@@ -203,7 +473,7 @@ app.get("/admin/logout", (c) => {
 // Admin Dashboard Home - Worker List
 app.get("/admin", adminAuth, async (c) => {
     const subdomain = c.get("subdomain");
-    if (subdomain !== "admin") {
+  if (!isLocalhostMode && subdomain !== "admin") {
         return c.text("Access admin via admin.domain.tld", 400);
     }
 
@@ -364,58 +634,921 @@ app.get("/admin/database", adminAuth, (c) => {
     return c.html(getDatabaseExplorerPage());
 });
 
+app.get("/admin/database/databases", adminAuth, async (c) => {
+  const databases = await listDatabaseNames();
+  return c.json<ApiResponse>({ success: true, data: { databases } });
+});
+
+app.post("/admin/database/databases", adminAuth, async (c) => {
+  const payload = await parseRequestPayload(c);
+  const databaseName = String(payload.name || "").trim();
+
+  if (!isValidDatabaseName(databaseName) || databaseName === "global") {
+    return c.json<ApiResponse>({ success: false, error: "Invalid database name" }, 400);
+  }
+
+  try {
+    await createDatabase(databaseName);
+    return c.json<ApiResponse>({ success: true, data: { database: databaseName } });
+  } catch (error) {
+    return c.json<ApiResponse>({ success: false, error: String(error) }, 400);
+  }
+});
+
+app.delete("/admin/database/databases/:database", adminAuth, async (c) => {
+  const databaseName = c.req.param("database");
+
+  if (!isValidDatabaseName(databaseName) || databaseName === "global") {
+    return c.json<ApiResponse>({ success: false, error: "Invalid database name" }, 400);
+  }
+
+  try {
+    await ensureDatabaseExists(databaseName);
+
+    const mappingRows = await db.execute({
+      sql: `SELECT physical_name FROM ${TABLE_META_TABLE} WHERE database_name = ?`,
+      args: [databaseName],
+    });
+
+    for (const row of mappingRows.rows) {
+      const physicalName = String((row as Record<string, unknown>).physical_name || "");
+      if (physicalName) {
+        await db.execute(`DROP TABLE IF EXISTS ${quoteIdentifier(physicalName)}`);
+      }
+    }
+
+    await db.execute({
+      sql: `DELETE FROM ${TABLE_META_TABLE} WHERE database_name = ?`,
+      args: [databaseName],
+    });
+
+    await db.execute({
+      sql: `DELETE FROM ${DATABASE_META_TABLE} WHERE name = ?`,
+      args: [databaseName],
+    });
+
+    return c.json<ApiResponse>({ success: true, data: { database: databaseName } });
+  } catch (error) {
+    const status = String(error).includes("not found") ? 404 : 500;
+    return c.json<ApiResponse>({ success: false, error: String(error) }, status);
+  }
+});
+
+app.get("/admin/database/databases/:database/tables", adminAuth, async (c) => {
+  const databaseName = c.req.param("database");
+
+  try {
+    if (databaseName !== "global") {
+      await ensureDatabaseExists(databaseName);
+    }
+
+    let tables: string[] = [];
+    if (databaseName === "global") {
+      const result = await db.execute(
+        `SELECT name FROM sqlite_master
+         WHERE type = 'table'
+           AND name NOT LIKE 'sqlite_%'
+           AND name NOT LIKE 'v8db_%'
+           AND name NOT IN ('${DATABASE_META_TABLE}', '${TABLE_META_TABLE}')
+         ORDER BY name`
+      );
+
+      tables = result.rows
+        .map((row) => String((row as Record<string, unknown>).name || ""))
+        .filter(Boolean);
+    } else {
+      const result = await db.execute({
+        sql: `SELECT table_name FROM ${TABLE_META_TABLE} WHERE database_name = ? ORDER BY table_name`,
+        args: [databaseName],
+      });
+
+      tables = result.rows
+        .map((row) => String((row as Record<string, unknown>).table_name || ""))
+        .filter(Boolean);
+    }
+
+    return c.json<ApiResponse>({ success: true, data: { database: databaseName, tables } });
+  } catch (error) {
+    const status = String(error).includes("not found") ? 404 : 400;
+    return c.json<ApiResponse>({ success: false, error: String(error) }, status);
+  }
+});
+
+app.post("/admin/database/databases/:database/tables", adminAuth, async (c) => {
+  const databaseName = c.req.param("database");
+
+  try {
+    if (databaseName !== "global") {
+      await ensureDatabaseExists(databaseName);
+    }
+
+    const payload = await parseRequestPayload(c);
+    const tableName = String(payload.tableName || "").trim();
+    const columns = Array.isArray(payload.columns) ? payload.columns as Array<Record<string, unknown>> : [];
+
+    if (!isValidIdentifier(tableName)) {
+      return c.json<ApiResponse>({ success: false, error: "Invalid table name" }, 400);
+    }
+
+    if (columns.length === 0) {
+      return c.json<ApiResponse>({ success: false, error: "Columns are required" }, 400);
+    }
+
+    const definitions = columns.map((column) => {
+      const columnName = String(column.name || "").trim();
+      const rawType = String(column.type || "TEXT").trim().toUpperCase();
+      const nullable = Boolean(column.nullable ?? true);
+      const primaryKey = Boolean(column.primaryKey ?? false);
+      const unique = Boolean(column.unique ?? false);
+      const autoIncrement = Boolean(column.autoIncrement ?? false);
+      const hasDefault = Object.prototype.hasOwnProperty.call(column, "default");
+      const defaultValue = column.default;
+
+      if (!isValidIdentifier(columnName)) {
+        throw new Error(`Invalid column name: ${columnName}`);
+      }
+
+      if (!/^[A-Z][A-Z0-9_()]*$/.test(rawType)) {
+        throw new Error(`Invalid column type: ${rawType}`);
+      }
+
+      let definition = `${quoteIdentifier(columnName)} ${rawType}`;
+
+      if (primaryKey) {
+        definition += " PRIMARY KEY";
+      }
+
+      if (autoIncrement) {
+        definition += " AUTOINCREMENT";
+      }
+
+      if (!nullable) {
+        definition += " NOT NULL";
+      }
+
+      if (unique) {
+        definition += " UNIQUE";
+      }
+
+      if (hasDefault) {
+        definition += ` DEFAULT ${sqlLiteral(defaultValue)}`;
+      }
+
+      return definition;
+    });
+
+    let targetTableName = tableName;
+    if (databaseName !== "global") {
+      const existing = await db.execute({
+        sql: `SELECT 1 AS ok FROM ${TABLE_META_TABLE} WHERE database_name = ? AND table_name = ? LIMIT 1`,
+        args: [databaseName, tableName],
+      });
+      if (existing.rows.length > 0) {
+        return c.json<ApiResponse>({ success: false, error: "Table already exists" }, 400);
+      }
+
+      targetTableName = getPhysicalTableName(databaseName, tableName);
+    }
+
+    const sql = `CREATE TABLE IF NOT EXISTS ${quoteIdentifier(targetTableName)} (${definitions.join(", ")})`;
+    await db.execute(sql);
+
+    if (databaseName !== "global") {
+      await db.execute({
+        sql: `INSERT INTO ${TABLE_META_TABLE} (database_name, table_name, physical_name) VALUES (?, ?, ?)`,
+        args: [databaseName, tableName, targetTableName],
+      });
+    }
+
+    return c.json<ApiResponse>({ success: true, data: { database: databaseName, table: tableName } });
+  } catch (error) {
+    const status = String(error).includes("not found") ? 404 : 400;
+    return c.json<ApiResponse>({ success: false, error: String(error) }, status);
+  }
+});
+
+app.delete("/admin/database/databases/:database/tables/:table", adminAuth, async (c) => {
+  const databaseName = c.req.param("database");
+  const tableName = c.req.param("table");
+
+  if (!isValidIdentifier(tableName)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid table name" }, 400);
+  }
+
+  try {
+    if (databaseName !== "global") {
+      await ensureDatabaseExists(databaseName);
+    }
+
+    const targetTableName = await resolveTableName(databaseName, tableName);
+    await db.execute(`DROP TABLE IF EXISTS ${quoteIdentifier(targetTableName)}`);
+
+    if (databaseName !== "global") {
+      await db.execute({
+        sql: `DELETE FROM ${TABLE_META_TABLE} WHERE database_name = ? AND table_name = ?`,
+        args: [databaseName, tableName],
+      });
+    }
+
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        database: databaseName,
+        table: tableName,
+      },
+    });
+  } catch (error) {
+    const status = String(error).includes("not found") ? 404 : 400;
+    return c.json<ApiResponse>({ success: false, error: String(error) }, status);
+  }
+});
+
+app.post("/admin/database/databases/:database/tables/:table/rows", adminAuth, async (c) => {
+  const databaseName = c.req.param("database");
+  const tableName = c.req.param("table");
+
+  if (!isValidIdentifier(tableName)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid table name" }, 400);
+  }
+
+  try {
+    if (databaseName !== "global") {
+      await ensureDatabaseExists(databaseName);
+    }
+
+    const targetTableName = await resolveTableName(databaseName, tableName);
+
+    const payload = await parseRequestPayload(c);
+    const data = payload.data as Record<string, unknown> | undefined;
+
+    if (!data || typeof data !== "object") {
+      return c.json<ApiResponse>({ success: false, error: "Body data is required" }, 400);
+    }
+
+    const entries = Object.entries(data);
+    const targetDb = getDatabaseClient();
+    let result;
+
+    if (entries.length === 0) {
+      result = await targetDb.execute(`INSERT INTO ${quoteIdentifier(targetTableName)} DEFAULT VALUES`);
+    } else {
+      const invalidColumn = entries.find(([column]) => !isValidIdentifier(column));
+      if (invalidColumn) {
+        return c.json<ApiResponse>({ success: false, error: `Invalid column name: ${invalidColumn[0]}` }, 400);
+      }
+
+      const columnsSql = entries.map(([column]) => quoteIdentifier(column)).join(", ");
+      const valuesSql = entries.map(() => "?").join(", ");
+      const args = entries.map(([, value]) => value);
+
+      result = await targetDb.execute({
+        sql: `INSERT INTO ${quoteIdentifier(targetTableName)} (${columnsSql}) VALUES (${valuesSql})`,
+        args,
+      });
+    }
+
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        database: databaseName,
+        table: tableName,
+        lastInsertRowid: result.lastInsertRowid !== undefined && result.lastInsertRowid !== null
+          ? String(result.lastInsertRowid)
+          : null,
+        rowsAffected: result.rowsAffected,
+      },
+    });
+  } catch (error) {
+    const status = String(error).includes("not found") ? 404 : 400;
+    return c.json<ApiResponse>({ success: false, error: String(error) }, status);
+  }
+});
+
+app.get("/admin/database/databases/:database/tables/:table/rows", adminAuth, async (c) => {
+  const databaseName = c.req.param("database");
+  const tableName = c.req.param("table");
+
+  if (!isValidIdentifier(tableName)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid table name" }, 400);
+  }
+
+  const limitRaw = Number(c.req.query("limit") || "100");
+  const offsetRaw = Number(c.req.query("offset") || "0");
+  const orderBy = c.req.query("orderBy");
+  const orderRaw = String(c.req.query("order") || "ASC").toUpperCase();
+
+  const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 1000) : 100;
+  const offset = Number.isFinite(offsetRaw) ? Math.max(offsetRaw, 0) : 0;
+  const order = orderRaw === "DESC" ? "DESC" : "ASC";
+
+  if (orderBy && !isValidIdentifier(orderBy)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid orderBy column" }, 400);
+  }
+
+  try {
+    if (databaseName !== "global") {
+      await ensureDatabaseExists(databaseName);
+    }
+
+    const targetTableName = await resolveTableName(databaseName, tableName);
+
+    const targetDb = getDatabaseClient();
+    const orderClause = orderBy ? ` ORDER BY ${quoteIdentifier(orderBy)} ${order}` : "";
+    const sql = `SELECT * FROM ${quoteIdentifier(targetTableName)}${orderClause} LIMIT ? OFFSET ?`;
+
+    const result = await targetDb.execute({ sql, args: [limit, offset] });
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        database: databaseName,
+        table: tableName,
+        rows: result.rows,
+        columns: result.columns,
+        rowCount: result.rows.length,
+      },
+    });
+  } catch (error) {
+    const status = String(error).includes("not found") ? 404 : 400;
+    return c.json<ApiResponse>({ success: false, error: String(error) }, status);
+  }
+});
+
+app.get("/admin/database/databases/:database/tables/:table/rows/:id", adminAuth, async (c) => {
+  const databaseName = c.req.param("database");
+  const tableName = c.req.param("table");
+  const id = c.req.param("id");
+
+  if (!isValidIdentifier(tableName)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid table name" }, 400);
+  }
+
+  try {
+    if (databaseName !== "global") {
+      await ensureDatabaseExists(databaseName);
+    }
+
+    const targetTableName = await resolveTableName(databaseName, tableName);
+
+    const targetDb = getDatabaseClient();
+    const result = await targetDb.execute({
+      sql: `SELECT * FROM ${quoteIdentifier(targetTableName)} WHERE id = ? LIMIT 1`,
+      args: [id],
+    });
+
+    if (result.rows.length === 0) {
+      return c.json<ApiResponse>({ success: false, error: "Row not found" }, 404);
+    }
+
+    return c.json<ApiResponse>({ success: true, data: { row: result.rows[0] } });
+  } catch (error) {
+    const status = String(error).includes("not found") ? 404 : 400;
+    return c.json<ApiResponse>({ success: false, error: String(error) }, status);
+  }
+});
+
+app.post("/admin/database/databases/:database/tables/:table/rows/search", adminAuth, async (c) => {
+  const databaseName = c.req.param("database");
+  const tableName = c.req.param("table");
+
+  if (!isValidIdentifier(tableName)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid table name" }, 400);
+  }
+
+  try {
+    if (databaseName !== "global") {
+      await ensureDatabaseExists(databaseName);
+    }
+
+    const targetTableName = await resolveTableName(databaseName, tableName);
+
+    const payload = await parseRequestPayload(c);
+    const { where, whereArgs } = parseWhereInput(payload);
+
+    const limitRaw = Number(payload.limit ?? 100);
+    const offsetRaw = Number(payload.offset ?? 0);
+    const orderBy = payload.orderBy ? String(payload.orderBy).trim() : "";
+    const orderRaw = String(payload.order || "ASC").toUpperCase();
+
+    const limit = Number.isFinite(limitRaw) ? Math.min(Math.max(limitRaw, 1), 1000) : 100;
+    const offset = Number.isFinite(offsetRaw) ? Math.max(offsetRaw, 0) : 0;
+    const order = orderRaw === "DESC" ? "DESC" : "ASC";
+
+    if (orderBy && !isValidIdentifier(orderBy)) {
+      return c.json<ApiResponse>({ success: false, error: "Invalid orderBy column" }, 400);
+    }
+
+    const orderClause = orderBy ? ` ORDER BY ${quoteIdentifier(orderBy)} ${order}` : "";
+    const sql = `SELECT * FROM ${quoteIdentifier(targetTableName)} WHERE ${where}${orderClause} LIMIT ? OFFSET ?`;
+
+    const targetDb = getDatabaseClient();
+    const result = await targetDb.execute({ sql, args: [...whereArgs, limit, offset] });
+
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        database: databaseName,
+        table: tableName,
+        rows: result.rows,
+        columns: result.columns,
+        rowCount: result.rows.length,
+      },
+    });
+  } catch (error) {
+    const status = String(error).includes("not found") ? 404 : 400;
+    return c.json<ApiResponse>({ success: false, error: String(error) }, status);
+  }
+});
+
+app.put("/admin/database/databases/:database/tables/:table/rows", adminAuth, async (c) => {
+  const databaseName = c.req.param("database");
+  const tableName = c.req.param("table");
+
+  if (!isValidIdentifier(tableName)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid table name" }, 400);
+  }
+
+  try {
+    if (databaseName !== "global") {
+      await ensureDatabaseExists(databaseName);
+    }
+
+    const targetTableName = await resolveTableName(databaseName, tableName);
+
+    const payload = await parseRequestPayload(c);
+    const data = payload.data as Record<string, unknown> | undefined;
+    if (!data || typeof data !== "object") {
+      return c.json<ApiResponse>({ success: false, error: "Body data is required" }, 400);
+    }
+
+    const entries = Object.entries(data);
+    if (entries.length === 0) {
+      return c.json<ApiResponse>({ success: false, error: "No columns to update" }, 400);
+    }
+
+    const invalidColumn = entries.find(([column]) => !isValidIdentifier(column));
+    if (invalidColumn) {
+      return c.json<ApiResponse>({ success: false, error: `Invalid column name: ${invalidColumn[0]}` }, 400);
+    }
+
+    const { where, whereArgs } = parseWhereInput(payload);
+    const setClause = entries.map(([column]) => `${quoteIdentifier(column)} = ?`).join(", ");
+    const args = [...entries.map(([, value]) => value), ...whereArgs];
+
+    const targetDb = getDatabaseClient();
+    const result = await targetDb.execute({
+      sql: `UPDATE ${quoteIdentifier(targetTableName)} SET ${setClause} WHERE ${where}`,
+      args,
+    });
+
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        database: databaseName,
+        table: tableName,
+        rowsAffected: result.rowsAffected,
+      },
+    });
+  } catch (error) {
+    const status = String(error).includes("not found") ? 404 : 400;
+    return c.json<ApiResponse>({ success: false, error: String(error) }, status);
+  }
+});
+
+app.delete("/admin/database/databases/:database/tables/:table/rows", adminAuth, async (c) => {
+  const databaseName = c.req.param("database");
+  const tableName = c.req.param("table");
+
+  if (!isValidIdentifier(tableName)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid table name" }, 400);
+  }
+
+  try {
+    if (databaseName !== "global") {
+      await ensureDatabaseExists(databaseName);
+    }
+
+    const targetTableName = await resolveTableName(databaseName, tableName);
+
+    const payload = await parseRequestPayload(c);
+    const { where, whereArgs } = parseWhereInput(payload);
+
+    const targetDb = getDatabaseClient();
+    const result = await targetDb.execute({
+      sql: `DELETE FROM ${quoteIdentifier(targetTableName)} WHERE ${where}`,
+      args: whereArgs,
+    });
+
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        database: databaseName,
+        table: tableName,
+        rowsAffected: result.rowsAffected,
+      },
+    });
+  } catch (error) {
+    const status = String(error).includes("not found") ? 404 : 400;
+    return c.json<ApiResponse>({ success: false, error: String(error) }, status);
+  }
+});
+
+app.put("/admin/database/databases/:database/tables/:table/rows/:id", adminAuth, async (c) => {
+  const databaseName = c.req.param("database");
+  const tableName = c.req.param("table");
+  const id = c.req.param("id");
+
+  if (!isValidIdentifier(tableName)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid table name" }, 400);
+  }
+
+  try {
+    if (databaseName !== "global") {
+      await ensureDatabaseExists(databaseName);
+    }
+
+    const targetTableName = await resolveTableName(databaseName, tableName);
+
+    const payload = await parseRequestPayload(c);
+    const data = payload.data as Record<string, unknown> | undefined;
+    if (!data || typeof data !== "object") {
+      return c.json<ApiResponse>({ success: false, error: "Body data is required" }, 400);
+    }
+
+    const entries = Object.entries(data);
+    if (entries.length === 0) {
+      return c.json<ApiResponse>({ success: false, error: "No columns to update" }, 400);
+    }
+
+    const invalidColumn = entries.find(([column]) => !isValidIdentifier(column));
+    if (invalidColumn) {
+      return c.json<ApiResponse>({ success: false, error: `Invalid column name: ${invalidColumn[0]}` }, 400);
+    }
+
+    const setClause = entries.map(([column]) => `${quoteIdentifier(column)} = ?`).join(", ");
+    const args = [...entries.map(([, value]) => value), id];
+
+    const targetDb = getDatabaseClient();
+    const result = await targetDb.execute({
+      sql: `UPDATE ${quoteIdentifier(targetTableName)} SET ${setClause} WHERE id = ?`,
+      args,
+    });
+
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        database: databaseName,
+        table: tableName,
+        id,
+        rowsAffected: result.rowsAffected,
+      },
+    });
+  } catch (error) {
+    const status = String(error).includes("not found") ? 404 : 400;
+    return c.json<ApiResponse>({ success: false, error: String(error) }, status);
+  }
+});
+
+app.delete("/admin/database/databases/:database/tables/:table/rows/:id", adminAuth, async (c) => {
+  const databaseName = c.req.param("database");
+  const tableName = c.req.param("table");
+  const id = c.req.param("id");
+
+  if (!isValidIdentifier(tableName)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid table name" }, 400);
+  }
+
+  try {
+    if (databaseName !== "global") {
+      await ensureDatabaseExists(databaseName);
+    }
+
+    const targetTableName = await resolveTableName(databaseName, tableName);
+
+    const targetDb = getDatabaseClient();
+    const result = await targetDb.execute({
+      sql: `DELETE FROM ${quoteIdentifier(targetTableName)} WHERE id = ?`,
+      args: [id],
+    });
+
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        database: databaseName,
+        table: tableName,
+        id,
+        rowsAffected: result.rowsAffected,
+      },
+    });
+  } catch (error) {
+    const status = String(error).includes("not found") ? 404 : 400;
+    return c.json<ApiResponse>({ success: false, error: String(error) }, status);
+  }
+});
+
+// Execute SQL Query (Global or specific database)
+app.post("/admin/database/query/global", adminAuth, async (c) => {
+  const payload = await parseRequestPayload(c);
+  const query = String(payload.query || "").trim();
+
+  if (!query) {
+    return c.json<ApiResponse>({ success: false, error: "Query is required" }, 400);
+  }
+
+  try {
+    const result = await db.execute(query);
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        database: "global",
+        rows: result.rows,
+        columns: result.columns,
+        rowsAffected: result.rowsAffected,
+      },
+    });
+  } catch (error) {
+    return c.json<ApiResponse>({ success: false, error: String(error) }, 500);
+  }
+});
+
+app.post("/admin/database/query/:database", adminAuth, async (c) => {
+  const databaseName = c.req.param("database");
+  const payload = await parseRequestPayload(c);
+  const query = String(payload.query || "").trim();
+
+  if (!query) {
+    return c.json<ApiResponse>({ success: false, error: "Query is required" }, 400);
+  }
+
+  if (databaseName !== "global" && !isValidDatabaseName(databaseName)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid database name" }, 400);
+  }
+
+  try {
+    if (databaseName !== "global") {
+      await ensureDatabaseExists(databaseName);
+    }
+
+    const targetDb = getDatabaseClient();
+    const rewrittenQuery = await rewriteQueryForDatabase(databaseName, query);
+    const result = await targetDb.execute(rewrittenQuery);
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        database: databaseName,
+        rows: result.rows,
+        columns: result.columns,
+        rowsAffected: result.rowsAffected,
+      },
+    });
+  } catch (error) {
+    const status = String(error).includes("not found") ? 404 : 500;
+    return c.json<ApiResponse>({ success: false, error: String(error) }, status);
+  }
+});
+
 // Execute SQL Query
 app.post("/admin/database/query", adminAuth, async (c) => {
-    const body = await c.req.parseBody();
-    const query = body.query as string;
+  const payload = await parseRequestPayload(c);
+  const query = String(payload.query || "").trim();
+  const databaseName = String(payload.database || "global").trim() || "global";
+
+  if (!query) {
+    return c.json<ApiResponse>({ success: false, error: "Query is required" }, 400);
+  }
+
+  if (databaseName !== "global" && !isValidDatabaseName(databaseName)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid database name" }, 400);
+  }
 
     try {
-        const result = await db.execute(query);
+    if (databaseName !== "global") {
+      await ensureDatabaseExists(databaseName);
+    }
+
+    const targetDb = getDatabaseClient();
+    const rewrittenQuery = await rewriteQueryForDatabase(databaseName, query);
+    const result = await targetDb.execute(rewrittenQuery);
         return c.json<ApiResponse>({
             success: true,
             data: {
+        database: databaseName,
                 rows: result.rows,
                 columns: result.columns,
                 rowsAffected: result.rowsAffected,
             },
         });
     } catch (error) {
-        return c.json<ApiResponse>({ success: false, error: String(error) }, 500);
+    const status = String(error).includes("not found") ? 404 : 500;
+    return c.json<ApiResponse>({ success: false, error: String(error) }, status);
     }
 });
+
+async function listAllBuckets(): Promise<S3Bucket[]> {
+  const response = await s3.send(new ListBucketsCommand({}));
+  return (response.Buckets || []).map((bucket) => ({
+    name: bucket.Name || "",
+    createdAt: bucket.CreationDate,
+  })).filter((bucket) => bucket.name);
+}
+
+async function deleteAllObjectsInBucket(bucketName: string): Promise<void> {
+  let continuationToken: string | undefined;
+  do {
+    const response = await s3.send(new ListObjectsV2Command({
+      Bucket: bucketName,
+      ContinuationToken: continuationToken,
+    }));
+
+    for (const object of response.Contents || []) {
+      if (!object.Key) {
+        continue;
+      }
+      await s3.send(new DeleteObjectCommand({
+        Bucket: bucketName,
+        Key: object.Key,
+      }));
+    }
+
+    continuationToken = response.NextContinuationToken;
+  } while (continuationToken);
+}
+
+async function renameBucket(oldName: string, newName: string): Promise<void> {
+  await s3.send(new CreateBucketCommand({ Bucket: newName }));
+
+  let continuationToken: string | undefined;
+  do {
+    const response = await s3.send(new ListObjectsV2Command({
+      Bucket: oldName,
+      ContinuationToken: continuationToken,
+    }));
+
+    for (const object of response.Contents || []) {
+      if (!object.Key) {
+        continue;
+      }
+
+      const encodedKey = encodeURIComponent(object.Key).replaceAll("%2F", "/");
+      await s3.send(new CopyObjectCommand({
+        Bucket: newName,
+        Key: object.Key,
+        CopySource: `${oldName}/${encodedKey}`,
+      }));
+
+      await s3.send(new DeleteObjectCommand({
+        Bucket: oldName,
+        Key: object.Key,
+      }));
+    }
+
+    continuationToken = response.NextContinuationToken;
+  } while (continuationToken);
+
+  await s3.send(new DeleteBucketCommand({ Bucket: oldName }));
+}
 
 // S3 Browser
 app.get("/admin/s3", adminAuth, async (c) => {
-    try {
-        const command = new ListObjectsV2Command({ Bucket: config.s3Bucket });
-        const response = await s3.send(command);
+  let selectedBucket = c.req.query("bucket") || config.s3DefaultBucket;
 
-        const objects: S3Object[] = (response.Contents || []).map((obj) => ({
-            key: obj.Key || "",
-            size: obj.Size || 0,
-            lastModified: obj.LastModified,
-        }));
-
-        return c.html(getS3BrowserPage(objects));
-    } catch (error) {
-        return c.html(getS3BrowserPage([], String(error)));
+  try {
+    const buckets = await listAllBuckets();
+    if (buckets.length > 0 && !buckets.some((bucket) => bucket.name === selectedBucket)) {
+      selectedBucket = buckets[0].name;
     }
+
+    let objects: S3Object[] = [];
+    if (selectedBucket) {
+      const response = await s3.send(new ListObjectsV2Command({ Bucket: selectedBucket }));
+      objects = (response.Contents || []).map((obj) => ({
+        key: obj.Key || "",
+        size: obj.Size || 0,
+        lastModified: obj.LastModified,
+      }));
+    }
+
+    return c.html(getS3BrowserPage(buckets, selectedBucket, objects));
+  } catch (error) {
+    const buckets = await listAllBuckets().catch(() => []);
+    return c.html(getS3BrowserPage(buckets, selectedBucket, [], String(error)));
+  }
+});
+
+// Create S3 Bucket
+app.post("/admin/s3/buckets", adminAuth, async (c) => {
+  const body = await c.req.parseBody();
+  const bucketName = String(body.bucketName || "").trim().toLowerCase();
+
+  if (!isValidBucketName(bucketName)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid bucket name" }, 400);
+  }
+
+  try {
+    await s3.send(new CreateBucketCommand({ Bucket: bucketName }));
+    return c.json<ApiResponse>({ success: true, data: { bucketName } });
+  } catch (error) {
+    return c.json<ApiResponse>({ success: false, error: String(error) }, 500);
+  }
+});
+
+// Rename S3 Bucket
+app.put("/admin/s3/buckets/:name", adminAuth, async (c) => {
+  const oldName = c.req.param("name");
+  const body = await c.req.parseBody();
+  const newName = String(body.newName || "").trim().toLowerCase();
+
+  if (!isValidBucketName(oldName) || !isValidBucketName(newName)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid bucket name" }, 400);
+  }
+
+  if (oldName === newName) {
+    return c.json<ApiResponse>({ success: true, data: { bucketName: oldName } });
+  }
+
+  try {
+    await renameBucket(oldName, newName);
+    return c.json<ApiResponse>({ success: true, data: { bucketName: newName } });
+  } catch (error) {
+    return c.json<ApiResponse>({ success: false, error: String(error) }, 500);
+  }
+});
+
+// Delete S3 Bucket
+app.delete("/admin/s3/buckets/:name", adminAuth, async (c) => {
+  const bucketName = c.req.param("name");
+
+  if (!isValidBucketName(bucketName)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid bucket name" }, 400);
+  }
+
+  try {
+    await deleteAllObjectsInBucket(bucketName);
+    await s3.send(new DeleteBucketCommand({ Bucket: bucketName }));
+    return c.json<ApiResponse>({ success: true });
+  } catch (error) {
+    return c.json<ApiResponse>({ success: false, error: String(error) }, 500);
+  }
 });
 
 // Delete S3 Object
-app.delete("/admin/s3/:key", adminAuth, async (c) => {
-    const key = c.req.param("key");
+app.delete("/admin/s3/object/:key", adminAuth, async (c) => {
+  const key = c.req.param("key");
+  const bucket = (c.req.query("bucket") || config.s3DefaultBucket).trim();
 
-    try {
-        const command = new DeleteObjectCommand({
-            Bucket: config.s3Bucket,
-            Key: key,
-        });
-        await s3.send(command);
-        return c.json<ApiResponse>({ success: true });
-    } catch (error) {
-        return c.json<ApiResponse>({ success: false, error: String(error) }, 500);
-    }
+  if (!isValidBucketName(bucket)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid bucket name" }, 400);
+  }
+
+  try {
+    await s3.send(new DeleteObjectCommand({
+      Bucket: bucket,
+      Key: key,
+    }));
+    return c.json<ApiResponse>({ success: true });
+  } catch (error) {
+    return c.json<ApiResponse>({ success: false, error: String(error) }, 500);
+  }
+});
+
+// Upload S3 Object
+app.post("/admin/s3/object", adminAuth, async (c) => {
+  const body = await c.req.parseBody();
+  const bucket = String(body.bucket || config.s3DefaultBucket).trim();
+  const file = body.file as File | undefined;
+  const providedKey = String(body.key || "").trim();
+
+  if (!isValidBucketName(bucket)) {
+    return c.json<ApiResponse>({ success: false, error: "Invalid bucket name" }, 400);
+  }
+
+  if (!file) {
+    return c.json<ApiResponse>({ success: false, error: "File is required" }, 400);
+  }
+
+  const key = providedKey || file.name;
+  if (!key) {
+    return c.json<ApiResponse>({ success: false, error: "Object key is required" }, 400);
+  }
+
+  try {
+    await s3.send(new PutObjectCommand({
+      Bucket: bucket,
+      Key: key,
+      Body: new Uint8Array(await file.arrayBuffer()),
+      ContentType: file.type || "application/octet-stream",
+    }));
+
+    return c.json<ApiResponse>({
+      success: true,
+      data: {
+        bucket,
+        key,
+        size: file.size,
+      },
+    });
+  } catch (error) {
+    return c.json<ApiResponse>({ success: false, error: String(error) }, 500);
+  }
 });
 
 // ============================================================================
@@ -458,7 +1591,7 @@ app.post("/webhook/git", async (c) => {
 app.all("/run/:func", async (c) => {
     const subdomain = c.get("subdomain");
 
-    if (subdomain !== "api") {
+  if (!isLocalhostMode && subdomain !== "api") {
         return c.json<ApiResponse>({ success: false, error: "Access workers via api.domain.tld" }, 400);
     }
 
@@ -533,7 +1666,70 @@ app.all("/run/:func", async (c) => {
 // PAGES HOSTING (*.domain.tld)
 // ============================================================================
 
+async function serveProjectFile(c: Context, projectName: string, requestPath: string) {
+  if (!isValidName(projectName)) {
+    return c.text("Invalid project name", 400);
+  }
+
+  const normalizedPath = requestPath === "/" ? "/index.html" : requestPath;
+  const filePath = join("./storage/pages", projectName, normalizedPath);
+
+  try {
+    if (!await exists(filePath)) {
+      const indexPath = join(filePath, "index.html");
+      if (await exists(indexPath)) {
+        const content = await Deno.readFile(indexPath);
+        return c.body(content, 200, { "Content-Type": "text/html" });
+      }
+      return c.notFound();
+    }
+
+    const stat = await Deno.stat(filePath);
+    if (stat.isDirectory) {
+      const indexPath = join(filePath, "index.html");
+      if (await exists(indexPath)) {
+        const content = await Deno.readFile(indexPath);
+        return c.body(content, 200, { "Content-Type": "text/html" });
+      }
+      return c.text("Directory listing not allowed", 403);
+    }
+
+    const content = await Deno.readFile(filePath);
+    const ext = extname(filePath);
+    const mimeType = getMimeType(ext);
+
+    return c.body(content, 200, { "Content-Type": mimeType });
+  } catch (error) {
+    console.error("Error serving file:", error);
+    return c.notFound();
+  }
+}
+
+app.get("/pages/:project", async (c) => {
+  if (!isLocalhostMode) {
+    return c.notFound();
+  }
+
+  const projectName = c.req.param("project");
+  return await serveProjectFile(c, projectName, "/");
+});
+
+app.get("/pages/:project/*", async (c) => {
+  if (!isLocalhostMode) {
+    return c.notFound();
+  }
+
+  const projectName = c.req.param("project");
+  const wildcardPath = c.req.param("*") || "";
+  const requestPath = `/${wildcardPath}`;
+  return await serveProjectFile(c, projectName, requestPath);
+});
+
 app.get("/*", async (c) => {
+  if (isLocalhostMode) {
+    return c.notFound();
+  }
+
     const subdomain = c.get("subdomain");
 
     // Skip admin and api subdomains
@@ -541,47 +1737,7 @@ app.get("/*", async (c) => {
         return c.notFound();
     }
 
-    if (!isValidName(subdomain)) {
-        return c.text("Invalid subdomain", 400);
-    }
-
-    const path = c.req.path === "/" ? "/index.html" : c.req.path;
-    const filePath = join("./storage/pages", subdomain, path);
-
-    try {
-        // Check if file exists
-        if (!await exists(filePath)) {
-            // Try index.html for directories
-            const indexPath = join(filePath, "index.html");
-            if (await exists(indexPath)) {
-                const content = await Deno.readFile(indexPath);
-                return c.body(content, 200, { "Content-Type": "text/html" });
-            }
-            return c.notFound();
-        }
-
-        const stat = await Deno.stat(filePath);
-
-        // If directory, try index.html
-        if (stat.isDirectory) {
-            const indexPath = join(filePath, "index.html");
-            if (await exists(indexPath)) {
-                const content = await Deno.readFile(indexPath);
-                return c.body(content, 200, { "Content-Type": "text/html" });
-            }
-            return c.text("Directory listing not allowed", 403);
-        }
-
-        // Serve file
-        const content = await Deno.readFile(filePath);
-        const ext = extname(filePath);
-        const mimeType = getMimeType(ext);
-
-        return c.body(content, 200, { "Content-Type": mimeType });
-    } catch (error) {
-        console.error("Error serving file:", error);
-        return c.notFound();
-    }
+    return await serveProjectFile(c, subdomain, c.req.path);
 });
 
 // ============================================================================
@@ -762,7 +1918,8 @@ function getWorkerEditorPage(name: string, code: string, logs: string[]): string
     
     async function testWorker() {
       const funcName = '${name}'.replace('.ts', '');
-      window.open('http://api.${config.domain}:${config.port}/run/' + funcName, '_blank');
+      const workerUrl = ${isLocalhostMode ? "window.location.origin + '/run/' + funcName" : "'http://api." + config.domain + ":" + config.port + "/run/' + funcName"};
+      window.open(workerUrl, '_blank');
     }
   </script>
 </body>
@@ -830,7 +1987,7 @@ function getPagesManagerPage(projects: PageProject[]): string {
               <tr class="border-t border-gray-700 hover:bg-gray-700/50">
                 <td class="px-6 py-4 font-mono">${p.name}</td>
                 <td class="px-6 py-4">${p.files} files</td>
-                <td class="px-6 py-4"><a href="http://${p.name}.${config.domain}:${config.port}" target="_blank" class="text-blue-400 hover:text-blue-300">http://${p.name}.${config.domain}:${config.port}</a></td>
+                <td class="px-6 py-4"><a href="${getProjectBaseUrl(p.name)}" target="_blank" class="text-blue-400 hover:text-blue-300">${getProjectBaseUrl(p.name)}</a></td>
                 <td class="px-6 py-4 text-right">
                   <button onclick="deleteProject('${p.name}')" class="text-red-400 hover:text-red-300">Delete</button>
                 </td>
@@ -896,7 +2053,7 @@ function getPagesManagerPage(projects: PageProject[]): string {
 }
 
 function getDatabaseExplorerPage(): string {
-    return `<!DOCTYPE html>
+  return `<!DOCTYPE html>
 <html lang="en">
 <head>
   <meta charset="UTF-8">
@@ -919,8 +2076,100 @@ function getDatabaseExplorerPage(): string {
   </nav>
   
   <div class="container mx-auto px-6 py-8">
+    <div id="dbMessage" class="mb-6"></div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-2 gap-6 mb-6">
+      <div class="bg-gray-800 rounded-lg p-6">
+        <h2 class="text-xl font-bold mb-4">Database Management</h2>
+        <div class="mb-4">
+          <label class="block mb-2 text-sm text-gray-300">Active Database</label>
+          <div class="flex gap-2">
+            <select id="databaseSelect" class="flex-1 bg-gray-900 border border-gray-700 rounded px-3 py-2"></select>
+            <button onclick="loadDatabases()" class="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded">Refresh</button>
+          </div>
+        </div>
+        <div class="mb-4">
+          <label class="block mb-2 text-sm text-gray-300">Create New Database</label>
+          <div class="flex gap-2">
+            <input id="newDatabaseName" type="text" placeholder="crm"
+              class="flex-1 bg-gray-900 border border-gray-700 rounded px-3 py-2" />
+            <button onclick="createDatabase()" class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded">Create</button>
+          </div>
+        </div>
+        <button onclick="deleteDatabase()" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded">Delete Active Database</button>
+      </div>
+
+      <div class="bg-gray-800 rounded-lg p-6">
+        <h2 class="text-xl font-bold mb-4">Table Management</h2>
+        <div class="mb-4">
+          <label class="block mb-2 text-sm text-gray-300">Active Table</label>
+          <div class="flex gap-2">
+            <select id="tableSelect" class="flex-1 bg-gray-900 border border-gray-700 rounded px-3 py-2"></select>
+            <button onclick="loadTables()" class="bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded">Refresh</button>
+          </div>
+        </div>
+        <div class="mb-4">
+          <label class="block mb-2 text-sm text-gray-300">Table Name</label>
+          <input id="newTableName" type="text" placeholder="customers"
+            class="w-full bg-gray-900 border border-gray-700 rounded px-3 py-2" />
+        </div>
+        <div class="mb-4">
+          <label class="block mb-2 text-sm text-gray-300">Columns (JSON Array)</label>
+          <textarea id="tableColumns" rows="6" class="w-full bg-gray-900 text-green-400 font-mono text-xs p-3 rounded border border-gray-700">[
+  {"name":"id","type":"INTEGER","primaryKey":true,"autoIncrement":true},
+  {"name":"name","type":"TEXT","nullable":false},
+  {"name":"email","type":"TEXT","unique":true},
+  {"name":"status","type":"TEXT","default":"active"}
+]</textarea>
+        </div>
+        <div class="flex flex-wrap gap-2">
+          <button onclick="createTable()" class="bg-purple-600 hover:bg-purple-700 px-4 py-2 rounded">Create Table</button>
+          <button onclick="deleteTable()" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded">Delete Active Table</button>
+          <button onclick="readRows()" class="bg-indigo-600 hover:bg-indigo-700 px-4 py-2 rounded">Refresh Table Content</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="bg-gray-800 rounded-lg p-6 mb-6">
+      <h2 class="text-xl font-bold mb-4">Rows CRUD</h2>
+      <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div>
+          <label class="block mb-2 text-sm text-gray-300">Insert Row (JSON Object)</label>
+          <textarea id="insertRowData" rows="6" class="w-full bg-gray-900 text-green-400 font-mono text-xs p-3 rounded border border-gray-700">{
+  "name": "Andi",
+  "email": "andi@example.com",
+  "status": "active"
+}</textarea>
+          <button onclick="insertRow()" class="mt-3 bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded">Insert Row</button>
+          <button onclick="readRows()" class="mt-3 ml-2 bg-gray-700 hover:bg-gray-600 px-4 py-2 rounded">Read Rows</button>
+        </div>
+
+        <div>
+          <label class="block mb-2 text-sm text-gray-300">Where Filter</label>
+          <input id="whereClause" type="text" value="email = ?"
+            class="w-full bg-gray-900 border border-gray-700 rounded px-3 py-2 mb-2" />
+          <label class="block mb-2 text-sm text-gray-300">Where Args (JSON Array)</label>
+          <textarea id="whereArgs" rows="3" class="w-full bg-gray-900 text-green-400 font-mono text-xs p-3 rounded border border-gray-700 mb-2">["andi@example.com"]</textarea>
+          <label class="block mb-2 text-sm text-gray-300">Update Data (JSON Object)</label>
+          <textarea id="updateWhereData" rows="3" class="w-full bg-gray-900 text-green-400 font-mono text-xs p-3 rounded border border-gray-700">{
+  "status": "inactive"
+}</textarea>
+          <div class="mt-3">
+            <button onclick="searchRows()" class="bg-cyan-600 hover:bg-cyan-700 px-4 py-2 rounded">Search</button>
+            <button onclick="updateRowsByWhere()" class="ml-2 bg-yellow-600 hover:bg-yellow-700 px-4 py-2 rounded">Update</button>
+            <button onclick="deleteRowsByWhere()" class="ml-2 bg-red-600 hover:bg-red-700 px-4 py-2 rounded">Delete</button>
+          </div>
+        </div>
+      </div>
+    </div>
+
     <div class="bg-gray-800 rounded-lg p-6 mb-6">
       <h2 class="text-2xl font-bold mb-4">Execute SQL Query</h2>
+      <div class="mb-4">
+        <label class="block mb-2 text-sm text-gray-300">Database (global atau nama database)</label>
+        <input id="databaseName" type="text" placeholder="global"
+          class="w-full bg-gray-900 text-white font-mono text-sm p-3 rounded border border-gray-700 focus:outline-none focus:ring-2 focus:ring-purple-500" />
+      </div>
       <textarea id="sqlQuery" rows="6" placeholder="SELECT * FROM users LIMIT 10;" 
         class="w-full bg-gray-900 text-green-400 font-mono text-sm p-4 rounded border border-gray-700 focus:outline-none focus:ring-2 focus:ring-purple-500"></textarea>
       <button onclick="executeQuery()" class="mt-4 bg-purple-600 hover:bg-purple-700 px-6 py-2 rounded-lg font-semibold">Execute</button>
@@ -933,8 +2182,420 @@ function getDatabaseExplorerPage(): string {
   </div>
   
   <script>
+    function getActiveDatabase() {
+      const selected = document.getElementById('databaseSelect');
+      if (!selected || !selected.value) return 'global';
+      return selected.value;
+    }
+
+    function getActiveTable() {
+      const selected = document.getElementById('tableSelect');
+      return selected && selected.value ? selected.value : '';
+    }
+
+    function showMessage(type, message) {
+      const el = document.getElementById('dbMessage');
+      const colors = {
+        success: 'bg-green-600',
+        error: 'bg-red-600',
+        info: 'bg-blue-600',
+      };
+      el.innerHTML = '<div class="' + (colors[type] || colors.info) + ' text-white px-4 py-2 rounded">' + message + '</div>';
+      setTimeout(() => {
+        if (el.innerHTML.includes(message)) {
+          el.innerHTML = '';
+        }
+      }, 3000);
+    }
+
+    function escapeHtml(value) {
+      return String(value)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#39;');
+    }
+
+    async function loadDatabases() {
+      try {
+        const res = await fetch('/admin/database/databases');
+        const data = await res.json();
+        if (!data.success) {
+          showMessage('error', data.error || 'Failed to load databases');
+          return;
+        }
+
+        const select = document.getElementById('databaseSelect');
+        const current = select.value || 'global';
+        const databases = data.data.databases || [];
+        select.innerHTML = databases.map((name) => '<option value="' + escapeHtml(name) + '">' + escapeHtml(name) + '</option>').join('');
+        select.value = databases.includes(current) ? current : (databases[0] || 'global');
+        document.getElementById('databaseName').value = select.value || 'global';
+        await loadTables();
+      } catch (err) {
+        showMessage('error', 'Failed to load databases: ' + err.message);
+      }
+    }
+
+    async function createDatabase() {
+      const name = document.getElementById('newDatabaseName').value.trim();
+      if (!name) {
+        showMessage('error', 'Database name is required');
+        return;
+      }
+
+      try {
+        const res = await fetch('/admin/database/databases', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name }),
+        });
+        const data = await res.json();
+        if (!data.success) {
+          showMessage('error', data.error || 'Failed to create database');
+          return;
+        }
+        showMessage('success', 'Database created: ' + name);
+        document.getElementById('newDatabaseName').value = '';
+        await loadDatabases();
+        document.getElementById('databaseSelect').value = name;
+        document.getElementById('databaseName').value = name;
+        await loadTables();
+      } catch (err) {
+        showMessage('error', 'Failed to create database: ' + err.message);
+      }
+    }
+
+    async function deleteDatabase() {
+      const database = getActiveDatabase();
+      if (database === 'global') {
+        showMessage('error', 'Database global tidak bisa dihapus');
+        return;
+      }
+      if (!confirm('Delete database ' + database + '?')) return;
+
+      try {
+        const res = await fetch('/admin/database/databases/' + encodeURIComponent(database), { method: 'DELETE' });
+        const data = await res.json();
+        if (!data.success) {
+          showMessage('error', data.error || 'Failed to delete database');
+          return;
+        }
+        showMessage('success', 'Database deleted: ' + database);
+        await loadDatabases();
+      } catch (err) {
+        showMessage('error', 'Failed to delete database: ' + err.message);
+      }
+    }
+
+    async function loadTables() {
+      const database = getActiveDatabase();
+      document.getElementById('databaseName').value = database;
+
+      try {
+        const res = await fetch('/admin/database/databases/' + encodeURIComponent(database) + '/tables');
+        const data = await res.json();
+        if (!data.success) {
+          showMessage('error', data.error || 'Failed to load tables');
+          return;
+        }
+
+        const tables = data.data.tables || [];
+        const select = document.getElementById('tableSelect');
+        const current = select.value || '';
+        select.innerHTML = tables.map((name) => '<option value="' + escapeHtml(name) + '">' + escapeHtml(name) + '</option>').join('');
+        if (tables.length > 0) {
+          select.value = tables.includes(current) ? current : tables[0];
+        }
+      } catch (err) {
+        showMessage('error', 'Failed to load tables: ' + err.message);
+      }
+    }
+
+    async function createTable() {
+      const database = getActiveDatabase();
+      const tableName = document.getElementById('newTableName').value.trim();
+      const columnsRaw = document.getElementById('tableColumns').value;
+
+      if (!tableName) {
+        showMessage('error', 'Table name is required');
+        return;
+      }
+
+      let columns;
+      try {
+        columns = JSON.parse(columnsRaw);
+      } catch {
+        showMessage('error', 'Columns JSON is invalid');
+        return;
+      }
+
+      try {
+        const res = await fetch('/admin/database/databases/' + encodeURIComponent(database) + '/tables', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ tableName, columns }),
+        });
+        const data = await res.json();
+        if (!data.success) {
+          showMessage('error', data.error || 'Failed to create table');
+          return;
+        }
+        showMessage('success', 'Table created: ' + tableName);
+        document.getElementById('newTableName').value = '';
+        await loadTables();
+        document.getElementById('tableSelect').value = tableName;
+      } catch (err) {
+        showMessage('error', 'Failed to create table: ' + err.message);
+      }
+    }
+
+    async function deleteTable() {
+      const database = getActiveDatabase();
+      const table = getActiveTable();
+
+      if (!table) {
+        showMessage('error', 'Pilih table terlebih dahulu');
+        return;
+      }
+
+      if (!confirm('Delete table ' + table + ' di database ' + database + '?')) return;
+
+      try {
+        const res = await fetch('/admin/database/databases/' + encodeURIComponent(database) + '/tables/' + encodeURIComponent(table), {
+          method: 'DELETE',
+        });
+        const data = await res.json();
+        if (!data.success) {
+          showMessage('error', data.error || 'Failed to delete table');
+          return;
+        }
+
+        showMessage('success', 'Table deleted: ' + table);
+        await loadTables();
+        document.getElementById('resultsContent').innerHTML = '<div class="text-gray-400">Table deleted. Select table lain untuk lihat isi.</div>';
+      } catch (err) {
+        showMessage('error', 'Failed to delete table: ' + err.message);
+      }
+    }
+
+    async function insertRow() {
+      const database = getActiveDatabase();
+      const table = getActiveTable();
+      if (!table) {
+        showMessage('error', 'Pilih table terlebih dahulu');
+        return;
+      }
+
+      let rowData;
+      try {
+        rowData = JSON.parse(document.getElementById('insertRowData').value);
+      } catch {
+        showMessage('error', 'Insert row JSON tidak valid');
+        return;
+      }
+
+      try {
+        const res = await fetch('/admin/database/databases/' + encodeURIComponent(database) + '/tables/' + encodeURIComponent(table) + '/rows', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: rowData }),
+        });
+        const data = await res.json();
+        if (!data.success) {
+          showMessage('error', data.error || 'Failed to insert row');
+          return;
+        }
+        showMessage('success', 'Row inserted. Affected: ' + (data.data.rowsAffected || 0));
+        await readRows();
+      } catch (err) {
+        showMessage('error', 'Failed to insert row: ' + err.message);
+      }
+    }
+
+    async function readRows() {
+      const database = getActiveDatabase();
+      const table = getActiveTable();
+      if (!table) {
+        showMessage('error', 'Pilih table terlebih dahulu');
+        return;
+      }
+
+      const resultsContent = document.getElementById('resultsContent');
+      resultsContent.innerHTML = '<div class="text-blue-400">Loading rows...</div>';
+
+      try {
+        const res = await fetch('/admin/database/databases/' + encodeURIComponent(database) + '/tables/' + encodeURIComponent(table) + '/rows?limit=50&order=DESC');
+        const data = await res.json();
+        if (!data.success) {
+          resultsContent.innerHTML = '<div class="text-red-400">Error: ' + (data.error || 'Failed to read rows') + '</div>';
+          return;
+        }
+
+        renderRowsResult(data.data);
+      } catch (err) {
+        resultsContent.innerHTML = '<div class="text-red-400">Error: ' + err.message + '</div>';
+      }
+    }
+
+    function parseWherePayload() {
+      const where = document.getElementById('whereClause').value.trim();
+      const whereArgsRaw = document.getElementById('whereArgs').value.trim() || '[]';
+
+      if (!where) {
+        throw new Error('Where clause is required');
+      }
+
+      let whereArgs;
+      try {
+        whereArgs = JSON.parse(whereArgsRaw);
+      } catch {
+        throw new Error('Where args JSON tidak valid');
+      }
+
+      if (!Array.isArray(whereArgs)) {
+        throw new Error('Where args harus array');
+      }
+
+      return { where, whereArgs };
+    }
+
+    async function searchRows() {
+      const database = getActiveDatabase();
+      const table = getActiveTable();
+      if (!table) {
+        showMessage('error', 'Pilih table terlebih dahulu');
+        return;
+      }
+
+      let wherePayload;
+      try {
+        wherePayload = parseWherePayload();
+      } catch (err) {
+        showMessage('error', err.message);
+        return;
+      }
+
+      const resultsContent = document.getElementById('resultsContent');
+      resultsContent.innerHTML = '<div class="text-blue-400">Searching rows...</div>';
+
+      try {
+        const res = await fetch('/admin/database/databases/' + encodeURIComponent(database) + '/tables/' + encodeURIComponent(table) + '/rows/search', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ ...wherePayload, limit: 50, offset: 0, order: 'DESC' }),
+        });
+        const data = await res.json();
+        if (!data.success) {
+          resultsContent.innerHTML = '<div class="text-red-400">Error: ' + (data.error || 'Search failed') + '</div>';
+          return;
+        }
+        renderRowsResult(data.data);
+      } catch (err) {
+        resultsContent.innerHTML = '<div class="text-red-400">Error: ' + err.message + '</div>';
+      }
+    }
+
+    async function updateRowsByWhere() {
+      const database = getActiveDatabase();
+      const table = getActiveTable();
+      if (!table) {
+        showMessage('error', 'Pilih table terlebih dahulu');
+        return;
+      }
+
+      let wherePayload;
+      let updateData;
+      try {
+        wherePayload = parseWherePayload();
+        updateData = JSON.parse(document.getElementById('updateWhereData').value);
+      } catch (err) {
+        showMessage('error', err.message || 'Payload tidak valid');
+        return;
+      }
+
+      try {
+        const res = await fetch('/admin/database/databases/' + encodeURIComponent(database) + '/tables/' + encodeURIComponent(table) + '/rows', {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ data: updateData, ...wherePayload }),
+        });
+        const data = await res.json();
+        if (!data.success) {
+          showMessage('error', data.error || 'Update failed');
+          return;
+        }
+        showMessage('success', 'Rows updated: ' + (data.data.rowsAffected || 0));
+        await searchRows();
+      } catch (err) {
+        showMessage('error', 'Update failed: ' + err.message);
+      }
+    }
+
+    async function deleteRowsByWhere() {
+      const database = getActiveDatabase();
+      const table = getActiveTable();
+      if (!table) {
+        showMessage('error', 'Pilih table terlebih dahulu');
+        return;
+      }
+
+      let wherePayload;
+      try {
+        wherePayload = parseWherePayload();
+      } catch (err) {
+        showMessage('error', err.message);
+        return;
+      }
+
+      if (!confirm('Delete rows di table ' + table + ' dengan filter saat ini?')) return;
+
+      try {
+        const res = await fetch('/admin/database/databases/' + encodeURIComponent(database) + '/tables/' + encodeURIComponent(table) + '/rows', {
+          method: 'DELETE',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(wherePayload),
+        });
+        const data = await res.json();
+        if (!data.success) {
+          showMessage('error', data.error || 'Delete failed');
+          return;
+        }
+        showMessage('success', 'Rows deleted: ' + (data.data.rowsAffected || 0));
+        await readRows();
+      } catch (err) {
+        showMessage('error', 'Delete failed: ' + err.message);
+      }
+    }
+
+    function renderRowsResult(result) {
+      const resultsContent = document.getElementById('resultsContent');
+      if (!result.rows || result.rows.length === 0) {
+        resultsContent.innerHTML = '<div class="text-gray-400">No rows found</div>';
+        return;
+      }
+
+      let html = '<div class="overflow-x-auto"><table class="w-full text-sm"><thead class="bg-gray-700"><tr>';
+      (result.columns || []).forEach((col) => {
+        html += '<th class="px-4 py-2 text-left">' + escapeHtml(col) + '</th>';
+      });
+      html += '</tr></thead><tbody>';
+      result.rows.forEach((row, i) => {
+        html += '<tr class="' + (i % 2 === 0 ? 'bg-gray-900' : 'bg-gray-800') + '">';
+        Object.values(row).forEach((val) => {
+          html += '<td class="px-4 py-2">' + (val !== null ? escapeHtml(val) : '<span class="text-gray-500">NULL</span>') + '</td>';
+        });
+        html += '</tr>';
+      });
+      html += '</tbody></table></div>';
+      html += '<div class="mt-4 text-gray-400">Rows returned: ' + result.rows.length + '</div>';
+      resultsContent.innerHTML = html;
+    }
+
     async function executeQuery() {
       const query = document.getElementById('sqlQuery').value;
+      const database = (document.getElementById('databaseName').value || 'global').trim() || 'global';
       const resultsContent = document.getElementById('resultsContent');
       
       if (!query.trim()) {
@@ -948,28 +2609,14 @@ function getDatabaseExplorerPage(): string {
         const res = await fetch('/admin/database/query', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: 'query=' + encodeURIComponent(query)
+          body: 'query=' + encodeURIComponent(query) + '&database=' + encodeURIComponent(database)
         });
         const data = await res.json();
         
         if (data.success) {
-          const result = data.data;
+          const result = data.data || {};
           if (result.rows && result.rows.length > 0) {
-            let html = '<div class="overflow-x-auto"><table class="w-full text-sm"><thead class="bg-gray-700"><tr>';
-            result.columns.forEach(col => {
-              html += '<th class="px-4 py-2 text-left">' + col + '</th>';
-            });
-            html += '</tr></thead><tbody>';
-            result.rows.forEach((row, i) => {
-              html += '<tr class="' + (i % 2 === 0 ? 'bg-gray-900' : 'bg-gray-800') + '">';
-              Object.values(row).forEach(val => {
-                html += '<td class="px-4 py-2">' + (val !== null ? String(val) : '<span class="text-gray-500">NULL</span>') + '</td>';
-              });
-              html += '</tr>';
-            });
-            html += '</tbody></table></div>';
-            html += '<div class="mt-4 text-gray-400">Rows returned: ' + result.rows.length + '</div>';
-            resultsContent.innerHTML = html;
+            renderRowsResult(result);
           } else {
             resultsContent.innerHTML = '<div class="text-green-400">Query executed successfully. Rows affected: ' + (result.rowsAffected || 0) + '</div>';
           }
@@ -980,12 +2627,33 @@ function getDatabaseExplorerPage(): string {
         resultsContent.innerHTML = '<div class="text-red-400">Error: ' + err.message + '</div>';
       }
     }
+
+    document.getElementById('databaseSelect').addEventListener('change', async () => {
+      const activeDb = getActiveDatabase();
+      document.getElementById('databaseName').value = activeDb;
+      await loadTables();
+    });
+
+    document.getElementById('tableSelect').addEventListener('change', async () => {
+      if (getActiveTable()) {
+        await readRows();
+      }
+    });
+
+    loadDatabases();
   </script>
 </body>
 </html>`;
 }
 
-function getS3BrowserPage(objects: S3Object[], error?: string): string {
+function getS3BrowserPage(buckets: S3Bucket[], selectedBucket: string, objects: S3Object[], error?: string): string {
+  const selectedBucketSafe = escapeHtml(selectedBucket);
+  const bucketOptions = buckets.map((bucket) => {
+    const safeName = escapeHtml(bucket.name);
+    const selected = bucket.name === selectedBucket ? "selected" : "";
+    return `<option value="${safeName}" ${selected}>${safeName}</option>`;
+  }).join("");
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1009,7 +2677,40 @@ function getS3BrowserPage(objects: S3Object[], error?: string): string {
   </nav>
   
   <div class="container mx-auto px-6 py-8">
-    <h2 class="text-2xl font-bold mb-6">Bucket: ${config.s3Bucket}</h2>
+    <h2 class="text-2xl font-bold mb-6">Bucket Management</h2>
+
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-6">
+      <div class="bg-gray-800 rounded-lg p-4">
+        <label class="block text-sm text-gray-300 mb-2">Active Bucket</label>
+        <select id="bucketSelect" onchange="switchBucket()" class="w-full bg-gray-900 border border-gray-700 rounded px-3 py-2">
+          ${bucketOptions || '<option value="">No buckets available</option>'}
+        </select>
+      </div>
+      <div class="bg-gray-800 rounded-lg p-4">
+        <label class="block text-sm text-gray-300 mb-2">Create New Bucket</label>
+        <div class="flex gap-2">
+          <input id="newBucketName" type="text" placeholder="my-project-bucket" class="flex-1 bg-gray-900 border border-gray-700 rounded px-3 py-2">
+          <button onclick="createBucket()" class="bg-green-600 hover:bg-green-700 px-4 py-2 rounded">Create</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="flex flex-wrap gap-2 mb-6">
+      <button onclick="renameBucket()" class="bg-yellow-600 hover:bg-yellow-700 px-4 py-2 rounded">Edit Bucket</button>
+      <button onclick="deleteBucket()" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded">Delete Bucket</button>
+    </div>
+
+    <div class="bg-gray-800 rounded-lg p-4 mb-6">
+      <label class="block text-sm text-gray-300 mb-2">Upload File ke Bucket Aktif</label>
+      <div class="grid grid-cols-1 md:grid-cols-3 gap-2">
+        <input id="uploadFile" type="file" class="bg-gray-900 border border-gray-700 rounded px-3 py-2">
+        <input id="uploadKey" type="text" placeholder="object key (opsional)" class="bg-gray-900 border border-gray-700 rounded px-3 py-2">
+        <button onclick="uploadObject()" class="bg-blue-600 hover:bg-blue-700 px-4 py-2 rounded">Upload</button>
+      </div>
+      <p class="text-xs text-gray-400 mt-2">Jika object key kosong, nama file akan dipakai.</p>
+    </div>
+
+    <h3 class="text-xl font-semibold mb-4">Active Bucket: ${selectedBucketSafe || "-"}</h3>
     
     ${error ? `<div class="bg-red-600 text-white px-4 py-3 rounded mb-6">Error: ${error}</div>` : ""}
     
@@ -1028,11 +2729,11 @@ function getS3BrowserPage(objects: S3Object[], error?: string): string {
             '<tr><td colspan="4" class="px-6 py-8 text-center text-gray-400">No objects found in bucket</td></tr>' :
             objects.map(obj => `
               <tr class="border-t border-gray-700 hover:bg-gray-700/50">
-                <td class="px-6 py-4 font-mono text-sm">${obj.key}</td>
+                <td class="px-6 py-4 font-mono text-sm">${escapeHtml(obj.key)}</td>
                 <td class="px-6 py-4">${(obj.size / 1024).toFixed(2)} KB</td>
                 <td class="px-6 py-4">${obj.lastModified ? new Date(obj.lastModified).toLocaleString() : "-"}</td>
                 <td class="px-6 py-4 text-right">
-                  <button onclick="deleteObject('${obj.key}')" class="text-red-400 hover:text-red-300">Delete</button>
+                  <button onclick='deleteObject(${JSON.stringify(obj.key)})' class="text-red-400 hover:text-red-300">Delete</button>
                 </td>
               </tr>
             `).join("")}
@@ -1042,10 +2743,132 @@ function getS3BrowserPage(objects: S3Object[], error?: string): string {
   </div>
   
   <script>
+    const activeBucket = ${JSON.stringify(selectedBucket)};
+
+    function switchBucket() {
+      const selected = document.getElementById('bucketSelect').value;
+      if (!selected) return;
+      location.href = '/admin/s3?bucket=' + encodeURIComponent(selected);
+    }
+
+    async function createBucket() {
+      const bucketName = document.getElementById('newBucketName').value.trim().toLowerCase();
+      if (!bucketName) {
+        alert('Bucket name is required');
+        return;
+      }
+
+      try {
+        const res = await fetch('/admin/s3/buckets', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'bucketName=' + encodeURIComponent(bucketName)
+        });
+        const data = await res.json();
+        if (data.success) {
+          location.href = '/admin/s3?bucket=' + encodeURIComponent(bucketName);
+        } else {
+          alert('Error: ' + data.error);
+        }
+      } catch (err) {
+        alert('Error: ' + err.message);
+      }
+    }
+
+    async function renameBucket() {
+      if (!activeBucket) {
+        alert('No active bucket selected');
+        return;
+      }
+
+      const newName = prompt('Rename bucket ' + activeBucket + ' to:', activeBucket);
+      if (!newName || newName.trim().toLowerCase() === activeBucket) return;
+
+      try {
+        const res = await fetch('/admin/s3/buckets/' + encodeURIComponent(activeBucket), {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: 'newName=' + encodeURIComponent(newName.trim().toLowerCase())
+        });
+        const data = await res.json();
+        if (data.success) {
+          location.href = '/admin/s3?bucket=' + encodeURIComponent(newName.trim().toLowerCase());
+        } else {
+          alert('Error: ' + data.error);
+        }
+      } catch (err) {
+        alert('Error: ' + err.message);
+      }
+    }
+
+    async function deleteBucket() {
+      if (!activeBucket) {
+        alert('No active bucket selected');
+        return;
+      }
+
+      if (!confirm('Delete bucket ' + activeBucket + ' and all objects inside it?')) return;
+
+      try {
+        const res = await fetch('/admin/s3/buckets/' + encodeURIComponent(activeBucket), { method: 'DELETE' });
+        const data = await res.json();
+        if (data.success) {
+          location.href = '/admin/s3';
+        } else {
+          alert('Error: ' + data.error);
+        }
+      } catch (err) {
+        alert('Error: ' + err.message);
+      }
+    }
+
     async function deleteObject(key) {
+      if (!activeBucket) {
+        alert('No active bucket selected');
+        return;
+      }
+
       if (!confirm('Delete object: ' + key + '?')) return;
       try {
-        const res = await fetch('/admin/s3/' + encodeURIComponent(key), { method: 'DELETE' });
+        const res = await fetch('/admin/s3/object/' + encodeURIComponent(key) + '?bucket=' + encodeURIComponent(activeBucket), { method: 'DELETE' });
+        const data = await res.json();
+        if (data.success) {
+          location.reload();
+        } else {
+          alert('Error: ' + data.error);
+        }
+      } catch (err) {
+        alert('Error: ' + err.message);
+      }
+    }
+
+    async function uploadObject() {
+      if (!activeBucket) {
+        alert('No active bucket selected');
+        return;
+      }
+
+      const fileInput = document.getElementById('uploadFile');
+      const keyInput = document.getElementById('uploadKey');
+      const file = fileInput.files && fileInput.files[0];
+
+      if (!file) {
+        alert('Pilih file terlebih dahulu');
+        return;
+      }
+
+      const formData = new FormData();
+      formData.append('bucket', activeBucket);
+      formData.append('file', file);
+      if (keyInput.value.trim()) {
+        formData.append('key', keyInput.value.trim());
+      }
+
+      try {
+        const res = await fetch('/admin/s3/object', {
+          method: 'POST',
+          body: formData,
+        });
         const data = await res.json();
         if (data.success) {
           location.reload();
@@ -1069,11 +2892,20 @@ console.log(`🚀 V8Box Server starting on port ${config.port}...`);
 console.log(`📦 Services initialized:`);
 console.log(`   - LibSQL: ${config.libsqlUrl}`);
 console.log(`   - Valkey: ${config.valkeyUrl}`);
-console.log(`   - S3: ${config.s3Endpoint} (bucket: ${config.s3Bucket})`);
+console.log(`   - S3: ${config.s3Endpoint}`);
+console.log(`     • Default bucket: ${config.s3DefaultBucket}`);
+console.log(`     • Projects bucket: ${config.s3ProjectsBucket}`);
+console.log(`     • Functions bucket: ${config.s3FunctionsBucket}`);
 console.log(`\n🌐 Access points:`);
-console.log(`   - Admin: http://admin.${config.domain}:${config.port}`);
-console.log(`   - API: http://api.${config.domain}:${config.port}/run/:func`);
-console.log(`   - Pages: http://*.${config.domain}:${config.port}`);
+if (isLocalhostMode) {
+  console.log(`   - Admin: http://localhost:${config.port}/admin`);
+  console.log(`   - API: http://localhost:${config.port}/run/:func`);
+  console.log(`   - Pages: http://localhost:${config.port}/pages/:project`);
+} else {
+  console.log(`   - Admin: http://admin.${config.domain}:${config.port}`);
+  console.log(`   - API: http://api.${config.domain}:${config.port}/run/:func`);
+  console.log(`   - Pages: http://*.${config.domain}:${config.port}`);
+}
 console.log(`\n🔐 Admin password: ${config.adminPassword}\n`);
 
 Deno.serve({ port: config.port }, app.fetch);

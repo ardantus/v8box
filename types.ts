@@ -52,3 +52,8 @@ export interface S3Object {
     size: number;
     lastModified?: Date;
 }
+
+export interface S3Bucket {
+    name: string;
+    createdAt?: Date;
+}

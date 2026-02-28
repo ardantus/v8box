@@ -1,7 +1,10 @@
 {
     "tasks": {
         "dev": "deno run --allow-net --allow-read --allow-write --allow-env --allow-run --watch server.ts",
-        "start": "deno run --allow-net --allow-read --allow-write --allow-env --allow-run server.ts"
+        "start": "deno run --allow-net --allow-read --allow-write --allow-env --allow-run server.ts",
+        "test:db-ui": "bash scripts/test-db-ui.sh",
+        "test:db-ui:full": "docker compose restart v8box && bash scripts/test-db-ui.sh",
+        "test:db-ui:ci": "bash scripts/test-db-ui-ci.sh"
     },
     "imports": {
         "hono": "https://deno.land/x/hono@v4.0.2/mod.ts",

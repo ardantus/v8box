@@ -4,9 +4,9 @@ services:
     image: caddy:2-alpine
     container_name: v8box-caddy
     ports:
-      - "80:80"
-      - "443:443"
-      - "443:443/udp"  # HTTP/3
+      - "8080:80"
+      - "8443:443"
+      - "8443:443/udp"  # HTTP/3
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile
       - caddy-data:/data
@@ -33,7 +33,9 @@ services:
       - S3_ENDPOINT=http://seaweedfs:8333
       - S3_ACCESS_KEY=${S3_ACCESS_KEY:-admin}
       - S3_SECRET_KEY=${S3_SECRET_KEY:-admin}
-      - S3_BUCKET=${S3_BUCKET:-v8box}
+      - S3_DEFAULT_BUCKET=${S3_DEFAULT_BUCKET:-v8box}
+      - S3_PROJECTS_BUCKET=${S3_PROJECTS_BUCKET:-v8box-projects}
+      - S3_FUNCTIONS_BUCKET=${S3_FUNCTIONS_BUCKET:-v8box-functions}
       - PORT=8000
     command: run --allow-all server.ts
     restart: unless-stopped
@@ -64,9 +66,10 @@ services:
   seaweedfs:
     image: chrislusf/seaweedfs:latest
     container_name: v8box-seaweedfs
-    command: "server -s3 -dir=/data -s3.port=8333 -filer"
+    command: "server -s3 -dir=/data -s3.port=8333 -s3.config=/etc/seaweedfs/s3.conf -filer"
     volumes:
       - seaweedfs-data:/data
+      - ./seaweedfs-s3.conf:/etc/seaweedfs/s3.conf:ro
     environment:
       - WEED_S3_AUDITLOGCONFIG=
     restart: unless-stopped

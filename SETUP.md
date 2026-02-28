@@ -42,7 +42,7 @@ deno task start
 
 ### 4. Access Admin Dashboard
 
-Open browser: `http://admin.localhost:8000`
+Open browser: `http://localhost:8000/admin`
 
 Login dengan password dari `.env`
 
@@ -59,23 +59,18 @@ Login dengan password dari `.env`
 | `S3_ENDPOINT` | SeaweedFS endpoint | `http://localhost:8333` | ✅ |
 | `S3_ACCESS_KEY` | S3 access key | - | ✅ |
 | `S3_SECRET_KEY` | S3 secret key | - | ✅ |
-| `S3_BUCKET` | S3 bucket name | `v8box` | ✅ |
+| `S3_DEFAULT_BUCKET` | Default bucket (general) | `v8box` | ✅ |
+| `S3_PROJECTS_BUCKET` | Bucket for project pages/assets | `v8box-projects` | ✅ |
+| `S3_FUNCTIONS_BUCKET` | Bucket for function uploads/data | `v8box-functions` | ✅ |
 | `S3_REGION` | S3 region | `us-east-1` | ❌ |
 | `DOMAIN` | Base domain | `domain.tld` | ✅ |
 | `PORT` | Server port | `8000` | ❌ |
 
 ### SeaweedFS Initial Setup
 
-SeaweedFS needs bucket creation:
+Buckets from `.env` are created automatically at startup (`S3_DEFAULT_BUCKET`, `S3_PROJECTS_BUCKET`, `S3_FUNCTIONS_BUCKET`).
 
-```bash
-# Install AWS CLI or use curl
-# Create bucket
-curl -X PUT http://localhost:8333/v8box
-
-# Or using AWS CLI
-aws --endpoint-url=http://localhost:8333 s3 mb s3://v8box
-```
+You can still create additional buckets from the Admin S3 page (`/admin/s3`) using the **Create New Bucket** form.
 
 Note: SeaweedFS default credentials:
 - Access Key: `any_key` (atau kosong)
@@ -101,7 +96,9 @@ api.domain.tld     A  your-server-ip
 
 ### Hosts File (Local Development)
 
-For local testing, edit hosts file:
+Jika `DOMAIN=localhost`, hosts file **tidak wajib** karena akses menggunakan path/subdirectory.
+
+Hosts file hanya diperlukan untuk mode subdomain (misalnya saat `DOMAIN=domain.tld` atau ingin simulasi subdomain lokal). Untuk local testing subdomain, edit hosts file:
 
 **Windows:** `C:\Windows\System32\drivers\etc\hosts`
 **Linux/Mac:** `/etc/hosts`
@@ -119,14 +116,14 @@ Add:
 
 ```bash
 # Should show login page
-curl http://admin.localhost:8000/
+curl http://localhost:8000/admin
 ```
 
 ### Test 2: Worker Execution
 
 ```bash
 # Test hello worker
-curl http://api.localhost:8000/run/hello
+curl http://localhost:8000/run/hello
 
 # Expected response:
 # {"success":true,"message":"Hello from V8Box!","visitorCount":1,...}
@@ -140,7 +137,7 @@ mkdir -p storage/pages/test
 echo '<h1>Test Page</h1>' > storage/pages/test/index.html
 
 # Access
-curl http://test.localhost:8000/
+curl http://localhost:8000/pages/test
 
 # Expected: <h1>Test Page</h1>
 ```
@@ -149,22 +146,22 @@ curl http://test.localhost:8000/
 
 ```bash
 # Access database explorer
-curl http://admin.localhost:8000/admin/database
+curl http://localhost:8000/admin/database
 
 # Or test via query worker
-curl "http://api.localhost:8000/run/query"
+curl "http://localhost:8000/run/query"
 ```
 
 ### Test 5: S3 Storage
 
 ```bash
 # Upload via worker
-curl -X POST http://api.localhost:8000/run/upload \
+curl -X POST http://localhost:8000/run/upload \
   -H "Content-Type: application/json" \
   -d '{"filename":"test.txt","content":"Hello S3!"}'
 
 # Check in admin
-curl http://admin.localhost:8000/admin/s3
+curl http://localhost:8000/admin/s3
 ```
 
 ## 🐛 Troubleshooting
@@ -207,9 +204,10 @@ curl -X PUT http://localhost:8333/v8box
 
 **Problem:** Browser cannot resolve `admin.localhost`
 
-**Solution 1 (Recommended):** Use ports directly
+**Solution 1 (Recommended):** Untuk `DOMAIN=localhost`, gunakan akses path/subdirectory
 - Admin: `http://localhost:8000/admin`
 - API: `http://localhost:8000/run/...`
+- Pages: `http://localhost:8000/pages/:project`
 
 **Solution 2:** Edit hosts file (see DNS Configuration above)
 

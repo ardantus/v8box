@@ -6,7 +6,7 @@ V8Box mendukung **dua mode deployment** yang berbeda:
 
 | Mode | Use Case | Components | SSL | Subdomain |
 |------|----------|------------|-----|-----------|
-| **Development** | Local testing | Manual Deno + Infrastructure | ❌ | ❌ |
+| **Development** | Local testing | Manual Deno + Infrastructure | ❌ | Optional |
 | **Production** | VPS deployment | Full Docker Stack + Caddy | ✅ | ✅ |
 
 ---
@@ -42,11 +42,9 @@ ADMIN_PASSWORD=dev-password
 # Service URLs otomatis handled oleh server.ts defaults
 ```
 
-#### 3. Create S3 Bucket
+#### 3. S3 Bucket Initialization
 
-```bash
-curl -X PUT http://localhost:8333/v8box
-```
+Bucket default akan dibuat otomatis saat server start (`S3_DEFAULT_BUCKET`, `S3_PROJECTS_BUCKET`, `S3_FUNCTIONS_BUCKET`).
 
 #### 4. Run Server Manually
 
@@ -57,11 +55,12 @@ deno task dev
 
 #### 5. Access Points
 
-- **Direct access** (tanpa subdomain):
+- **Direct access** (recommended untuk `DOMAIN=localhost`):
   - Admin: `http://localhost:8000/admin`
   - API: `http://localhost:8000/run/hello`
+  - Pages: `http://localhost:8000/pages/test`
 
-- **Dengan subdomain** (perlu edit hosts):
+- **Dengan subdomain** (opsional, perlu edit hosts):
   - `http://admin.localhost:8000`
   - `http://api.localhost:8000/run/hello`
   - `http://test.localhost:8000` (untuk pages)
@@ -138,7 +137,9 @@ CLOUDFLARE_TOKEN=your-cloudflare-api-token
 ADMIN_PASSWORD=strong-production-password
 S3_ACCESS_KEY=admin
 S3_SECRET_KEY=strong-secret-here
-S3_BUCKET=v8box
+S3_DEFAULT_BUCKET=v8box
+S3_PROJECTS_BUCKET=v8box-projects
+S3_FUNCTIONS_BUCKET=v8box-functions
 ```
 
 #### 3. Configure DNS
