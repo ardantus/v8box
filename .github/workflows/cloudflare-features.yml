@@ -33,25 +33,25 @@ jobs:
 
       - name: Run Queue Tests
         run: |
-          deno run --allow-env --allow-read --allow-write --allow-net queue.ts queue:stats --queue=default
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts queue:stats --queue=default
           echo "✅ Queue tests passed"
 
       - name: Run Durable Objects Tests
         run: |
-          deno run --allow-env --allow-read --allow-write --allow-net durable_objects.ts obj:create --name=test-obj
-          deno run --allow-env --allow-read --allow-write --allow-net durable_objects.ts obj:list
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts obj:create --name=test-obj
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts obj:list
           echo "✅ Durable Objects tests passed"
 
       - name: Run Cache Purge Tests
         run: |
-          deno run --allow-env --allow-read --allow-write --allow-net cache_purge.ts cache:set --key=test-key --value={"test":"data"}
-          deno run --allow-env --allow-read --allow-write --allow-net cache_purge.ts cache:get --key=test-key
-          deno run --allow-env --allow-read --allow-write --allow-net cache_purge.ts cache:stats
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts cache:set --key=test-key --value='{"test":"data"}'
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts cache:get --key=test-key
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts cache:stats
           echo "✅ Cache purge tests passed"
 
       - name: Run Rate Limit Tests
         run: |
-          deno run --allow-env --allow-read --allow-write --allow-net rate_limit.ts rate:check --ip=127.0.0.1 --rule=default
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts rate:check --ip=127.0.0.1 --rule=default
           echo "✅ Rate limit tests passed"
 
   # ── 2. Integration Test (Queue Workflow) ──
@@ -75,32 +75,32 @@ jobs:
 
       - name: Enqueue test task
         run: |
-          deno run --allow-env --allow-read --allow-write --allow-net queue.ts queue:send --queue=api --payload='{"cmd":"test","data":{"hello":"world"}}'
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts queue:send --queue=api --payload='{"cmd":"test","data":{"hello":"world"}}'
           echo "✅ Task enqueued"
 
       - name: Pull task from queue
         run: |
-          deno run --allow-env --allow-read --allow-write --allow-net queue.ts queue:pull --queue=api
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts queue:pull --queue=api
           echo "✅ Task pulled"
 
       - name: Verify task stats
         run: |
-          deno run --allow-env --allow-read --allow-write --allow-net queue.ts queue:stats --queue=api
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts queue:stats --queue=api
 
       - name: Durable object test
         run: |
-          deno run --allow-env --allow-read --allow-write --allow-net durable_objects.ts obj:create --name=integration-test
-          deno run --allow-env --allow-read --allow-write --allow-net durable_objects.ts obj:list
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts obj:create --name=integration-test
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts obj:list
 
       - name: Cache purge test
         run: |
-          deno run --allow-env --allow-read --allow-write --allow-net cache_purge.ts cache:set --key=integration-key --value='{"integration":"test"}'
-          deno run --allow-env --allow-read --allow-write --allow-net cache_purge.ts cache:purge --tag=default
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts cache:set --key=integration-key --value='{"integration":"test"}'
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts cache:purge --tag=default
           echo "✅ Cache purge tests passed"
 
       - name: Rate limit test
         run: |
-          deno run --allow-env --allow-read --allow-write --allow-net rate_limit.ts rate:check --ip=127.0.0.1 --rule=default
+          deno run --allow-env --allow-read --allow-write --allow-net cli.ts rate:check --ip=127.0.0.1 --rule=default
           echo "✅ Rate limit tests passed"
 
       - name: Cleanup
