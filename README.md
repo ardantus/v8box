@@ -14,6 +14,10 @@
 * **Automatic HTTPS:** SSL Wildcard otomatis untuk semua subdomain menggunakan **Caddy** dan Cloudflare DNS.
 * **Mini Code Editor:** Edit kode Worker langsung dari Dashboard Admin.
 * **Git Sync:** Dukungan webhook untuk sinkronisasi otomatis dari GitHub/GitLab.
+* **Cloudflare-Queues:** Task queue dengan Valkey/ Redis (retry, DLQ, delay)
+* **Cloudflare-Durable Objects:** State management dengan Redis
+* **Cache Purging:** Redis-based cache invalidation
+* **Rate Limiting:** Per-IP, per-API-key, per-endpoint
 
 ---
 
